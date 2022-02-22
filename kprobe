@@ -1,0 +1,39 @@
+#include <linux/module.h>	/* Needed by all modules */
+#include <linux/kernel.h>	/* Needed for KERN_INFO */
+#include <linux/kprobes.h>
+MODULE_LICENSE("GPL");
+
+struct kprobe p = {0};
+
+static int kprobe_pre_handler_test (struct kprobe *kp, struct pt_regs *pt_regs)
+{
+
+	printk("....kprobe pre-handler called\n");
+	return 0;
+
+}
+
+int init_module(void) 
+{
+	int err;
+	p.symbol_name = "printk";
+	p.pre_handler = kprobe_pre_handler_test;
+	p.post_handler = NULL;
+	
+	err = register_kprobe(&p);
+	if (err < 0) {
+		printk("kprobe registeration failed\n");
+	}
+
+	
+	printk("mpdule loaded\n");
+
+	return 0;
+}
+
+
+void cleanup_module(void)
+{
+	printk(KERN_INFO "Goodbye world 1.\n");
+	 unregister_kprobe(&p);
+}
