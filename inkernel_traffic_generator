@@ -1,0 +1,276 @@
+#include <linux/module.h>	/* Needed by all modules */
+#include <linux/kernel.h>	/* Needed for KERN_INFO */
+#include <linux/slab.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <net/net_namespace.h>
+#include <linux/netdevice.h>
+#include <vdso/limits.h>
+MODULE_LICENSE("GPL");
+
+
+struct thread_data {
+	struct sk_buff *skb;
+	u8 thread_id;
+}____cacheline_aligned_in_smp;
+
+static char interface_name[NAME_MAX] = "deimos0";
+module_param_string(interface, interface_name, NAME_MAX, S_IRUGO|S_IWUSR);
+
+static u32 pkt_len 64;
+module_param_named(len, pkt_len, uint, S_IRUGO|S_IWUSR);
+
+u8 pkt[pkt_len];
+
+struct task_struct **task = NULL;
+struct task_struct *stats_task = NULL;
+
+struct net_device *netdev_glb = NULL;
+struct thread_data *data_base_ptr = NULL;
+
+DEFINE_PER_CPU(u64, total_pkts);
+DEFINE_PER_CPU(u64, total_bytes);
+
+static int traffic_gen (void *data) 
+{
+	struct net_device *netdev = netdev_glb;
+	struct thread_data *arg = data;
+	u8 thread_id = arg->thread_id;
+	struct sk_buff *skb = arg->skb;
+	int ref_count = USHRT_MAX;
+	u16 counter = 0;
+	struct netdev_queue *netdev_queue;
+	netdev_tx_t (*netdev_tx) (struct sk_buff *skb,struct net_device *netdev);
+	
+	netdev_tx = netdev->netdev_ops->ndo_start_xmit;
+	
+	memset(pkt, thread_id + 1, pkt_len);
+	memcpy(skb_put(skb, pkt_len),pkt,pkt_len);
+	skb_set_queue_mapping(skb, thread_id);
+	netdev_queue = netdev_get_tx_queue(netdev,thread_id);
+	
+	atomic_add(ref_count - 1 , (atomic_t *) &skb->users);
+
+	*this_cpu_ptr(&total_pkts) = 0;
+	*this_cpu_ptr(&total_bytes) = 0;
+
+	while (!kthread_should_stop()) {
+	
+		while (!netif_xmit_stopped(netdev_queue)) {
+		
+			if (unlikely(++counter == 64)) {
+				counter = 0;
+				__this_cpu_write(softnet_data.xmit.more,0);
+			}
+		
+			netdev_tx(skb, netdev);
+			ref_count--;
+			
+			*this_cpu_ptr(&total_pkts) += 1 ;
+			*this_cpu_ptr(&total_bytes) += pkt_len;
+		
+			if (unlikely(ref_count == 1)) {
+				ref_count += (USHRT_MAX -1);	
+				atomic_add(USHRT_MAX -1 , (atomic_t *) &skb->users);
+			
+			}
+			
+			__this_cpu_write(softnet_data.xmit.more,1);
+
+		}
+		
+		//printk("Queue stopped thread id %d\n",thread_id);
+		
+		schedule();
+	}
+	
+	//printk("skb->users = %d , ref_count  %d\n",atomic_read((atomic_t *) &skb->users),ref_count);
+
+	atomic_sub(ref_count - 1, (atomic_t *) &skb->users);	
+
+	return 0;
+}
+
+
+static int show_stats_thread (void * data)
+{
+	int i, num_threads;
+	u64 t0_ns, delta_ns;
+	u64 curr_pkts = 0, curr_bytes = 0, prev_pkts = 0, prev_bytes = 0;
+	msleep(500); /*This is to make sure that all threads are up and running, not a good way though*/
+	
+	num_threads = min(netdev_glb->real_num_tx_queues, num_online_cpus());
+	
+	for (i = 0; i < num_threads;i++) {
+		prev_pkts += per_cpu(total_pkts, i);
+		prev_bytes += per_cpu(total_bytes, i);
+	}
+
+	t0_ns = ktime_get_ns();
+
+	while (!kthread_should_stop()) {
+	
+		msleep(1000);
+
+		for (i = 0; i < num_threads;i++) {
+			curr_bytes += per_cpu(total_bytes, i);
+			curr_pkts += per_cpu(total_pkts, i);
+		}
+			
+		delta_ns = ktime_get_ns();
+		printk("Data rate %lld Gbits/s , %lld Million Pkts/s \n",((curr_bytes - prev_bytes)*8)/(delta_ns - t0_ns),
+		(curr_pkts - prev_pkts)*1000/(delta_ns - t0_ns));
+		prev_bytes = curr_bytes;
+		prev_pkts = curr_pkts;
+		curr_bytes = 0;
+		curr_pkts = 0;
+		t0_ns = delta_ns;
+		//schedule();	
+	}
+
+
+	return 0;
+
+}
+
+void deinit_threads (int num_of_threads, struct thread_data *data)
+{
+	int i = 0;
+
+	for (; i < num_of_threads; i++) {
+		if (task[i])
+			kthread_stop(task[i]);
+		if(data[i].skb)
+			dev_kfree_skb_any(data[i].skb);
+	
+	}
+}
+
+int create_kthreads (int num_of_threads)
+{
+	int i = 0,rv = 0;
+	struct sk_buff *skb;
+	struct thread_data *data;
+	
+	task = kmalloc (num_of_threads * sizeof(int *), GFP_KERNEL);
+	if (!task) {
+		pr_err("Low memory: task allocation failed\n");
+		return -ENOMEM;
+	}
+	
+	data = kzalloc( num_of_threads * sizeof(struct thread_data), GFP_KERNEL);
+	if (!data) {
+		pr_err("Low memory: ptr allocation failed\n");
+		rv = -ENOMEM;
+		goto free_task;
+	}
+	
+	data_base_ptr = data;
+
+	for (; i < num_of_threads; i++) {
+
+		data[i].thread_id = i;
+		
+		skb = __netdev_alloc_skb(netdev_glb, pkt_len, GFP_KERNEL);
+		if (!skb) {
+			pr_err("skb_allocation failed: exiting\n");
+			rv = -ENOMEM;
+			goto exit;
+		}
+		
+		data[i].skb = skb;
+		
+		task[i] = kthread_create(traffic_gen, &data[i], "traffic_gen");
+		if(task[i])
+		{
+			kthread_bind(task[i],i % num_online_cpus());
+			wake_up_process(task[i]);
+		}
+		else {
+			printk("Thread Creation failed: exiting\n");
+			rv = -ENOMEM;
+			goto exit;
+		}
+	
+	}
+	
+	stats_task = kthread_create(show_stats_thread, NULL, "show_stats_thread");
+	if(stats_task){ 
+	
+		kthread_bind(stats_task, 4 % num_online_cpus()); /*Todo: Randomly choosing 4th core:*/
+		wake_up_process(stats_task);
+	}
+	else {
+		printk("Thread Creation failed: exiting\n");
+		rv = -ENOMEM;
+		goto exit;
+	}
+
+	return 0;
+
+exit:
+	deinit_threads(num_of_threads, data);
+	kfree(data);
+free_task:	
+	kfree(task);	
+	return rv;
+
+}
+
+int init_module(void)
+{
+	struct net *net; /*network namespace identifier*/
+	struct net_device *netdev;
+	int rv = -1;
+	printk("module loaded\n");
+	
+	for_each_net(net) {
+	
+		for_each_netdev(net, netdev) {
+			if (netdev) {
+				if (!strcmp(netdev->name, interface_name)) {
+					netdev_glb = netdev;
+					rv = create_kthreads(min(netdev->real_num_tx_queues, num_online_cpus()));
+					if (rv) {
+						pr_err("Thread creation failed with error code %d\n",rv);
+						return rv;
+					}
+					
+					printk("Interface found netdev name %s, Tx queues %d\n",
+						netdev_glb->name,netdev->real_num_tx_queues);
+					
+					goto exit;
+				}
+			}
+		
+		}
+	
+	}
+
+	pr_info("Interface not found: exiting\n");
+exit:
+	return rv;
+}
+
+void cleanup_module(void)
+{
+	u64 total_bytes_sent = 0, total_pkts_sent = 0;
+	int i = 0, num_threads = min(netdev_glb->real_num_tx_queues, num_online_cpus());
+
+	deinit_threads(num_threads, data_base_ptr);
+	kthread_stop(stats_task);
+	
+	for(; i <num_threads; i++) {
+		total_bytes_sent += per_cpu(total_bytes, i);
+		total_pkts_sent += per_cpu(total_pkts, i);
+	}
+	
+	printk("total_bytes_sent = %lld, total_pkts_sent = %lld\n",total_bytes_sent,total_pkts_sent);
+	
+	kfree(data_base_ptr);
+	kfree(task);
+	
+	printk(KERN_INFO "Module unloaded\n");
+	
+	
+}
