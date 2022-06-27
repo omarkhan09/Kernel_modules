@@ -11,7 +11,7 @@ int init_module(void)
 	printk("Module loaded\n");	
 	
 	preempt_disable();
-	
+	local_irq_disable();
 	t1 = ktime_get_ns();
 	for (i = 0; i < 10000000; i++) {
 	
@@ -29,6 +29,8 @@ int init_module(void)
 	
 	delta_t = ktime_get_ns() - t1;
 
+	local_irq_enable();
+	
 	printk("init module ends: delta T = %ld, i = %ld, x = %d\n",delta_t,i,x);
 	preempt_enable();
 	
