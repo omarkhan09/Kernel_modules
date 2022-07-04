@@ -1,4 +1,4 @@
-  GNU nano 2.9.8                                                                                                                                                                                                                             vfio_user.c                                                                                                                                                                                                                                       
+                                                                                                                                                                                                                           vfio_user.c                                                                                                                                                                                                                                       
 
 #include<stdio.h>
 #include <linux/vfio.h>
